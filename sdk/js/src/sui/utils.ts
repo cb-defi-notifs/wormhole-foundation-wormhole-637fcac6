@@ -446,3 +446,47 @@ export const padSuiType = (type: string): string => {
  */
 export const trimSuiType = (type: string): string =>
   type.replace(/(0x)(0*)/g, "0x");
+
+/**
+ * Create a new EmitterCap object owned by owner.
+ * @returns The created EmitterCap object ID
+ */
+export const newEmitterCap = (
+  coreBridgePackageId: string,
+  coreBridgeStateObjectId: string,
+  owner: string
+): TransactionBlock => {
+  const tx = new TransactionBlock();
+  const [emitterCap] = tx.moveCall({
+    target: `${coreBridgePackageId}::emitter::new`,
+    arguments: [tx.object(coreBridgeStateObjectId)],
+  });
+  tx.transferObjects([emitterCap], tx.pure(owner));
+  return tx;
+};
+
+/**
+ * Get the first EmitterCap object ID returned by the RPC or null if it doesn't exist
+ */
+export const getEmitterCapObjectId = async (
+  provider: JsonRpcProvider,
+  coreBridgePackageId: string,
+  owner: string,
+  version?: string
+): Promise<string | null> => {
+  const result = await provider.getOwnedObjects({
+    owner,
+    filter: {
+      StructType: `${coreBridgePackageId}::emitter::EmitterCap`,
+      Version: version,
+    },
+    options: {
+      showContent: true,
+    },
+  });
+  if (!result || !result.data) {
+    throw new SuiRpcValidationError(result);
+  }
+  const objects = result.data.filter((o) => o.data?.objectId);
+  return objects?.[0]?.data?.objectId || null;
+};

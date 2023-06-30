@@ -922,6 +922,10 @@ export function transferFromAptos(
   );
 }
 
+/**
+ * Transfer an asset from Sui to another chain.
+ * `emitterCapObjectId` is required when transferring with a payload.
+ */
 export async function transferFromSui(
   provider: JsonRpcProvider,
   coreBridgeStateObjectId: string,
@@ -935,12 +939,9 @@ export async function transferFromSui(
   relayerFee: bigint = BigInt(0),
   payload: Uint8Array | null = null,
   coreBridgePackageId?: string,
-  tokenBridgePackageId?: string
-) {
-  if (payload !== null) {
-    throw new Error("Sui transfer with payload not implemented");
-  }
-
+  tokenBridgePackageId?: string,
+  emitterCapObjectId?: string
+): Promise<TransactionBlock> {
   const [primaryCoin, ...mergeCoins] = coins.filter((coin) =>
     isSameType(coin.coinType, coinType)
   );
@@ -980,36 +981,77 @@ export async function transferFromSui(
     arguments: [tx.object(tokenBridgeStateObjectId)],
     typeArguments: [coinType],
   });
-  const [transferTicket, dust] = tx.moveCall({
-    target: `${tokenBridgePackageId}::transfer_tokens::prepare_transfer`,
-    arguments: [
-      assetInfo,
-      transferCoin,
-      tx.pure(coalesceChainId(recipientChain)),
-      tx.pure([...recipient]),
-      tx.pure(relayerFee),
-      tx.pure(createNonce().readUInt32LE()),
-    ],
-    typeArguments: [coinType],
-  });
-  tx.moveCall({
-    target: `${tokenBridgePackageId}::coin_utils::return_nonzero`,
-    arguments: [dust],
-    typeArguments: [coinType],
-  });
-  const [messageTicket] = tx.moveCall({
-    target: `${tokenBridgePackageId}::transfer_tokens::transfer_tokens`,
-    arguments: [tx.object(tokenBridgeStateObjectId), transferTicket],
-    typeArguments: [coinType],
-  });
-  tx.moveCall({
-    target: `${coreBridgePackageId}::publish_message::publish_message`,
-    arguments: [
-      tx.object(coreBridgeStateObjectId),
-      feeCoin,
-      messageTicket,
-      tx.object(SUI_CLOCK_OBJECT_ID),
-    ],
-  });
-  return tx;
+  if (payload === null) {
+    const [transferTicket, dust] = tx.moveCall({
+      target: `${tokenBridgePackageId}::transfer_tokens::prepare_transfer`,
+      arguments: [
+        assetInfo,
+        transferCoin,
+        tx.pure(coalesceChainId(recipientChain)),
+        tx.pure([...recipient]),
+        tx.pure(relayerFee),
+        tx.pure(createNonce().readUInt32LE()),
+      ],
+      typeArguments: [coinType],
+    });
+    tx.moveCall({
+      target: `${tokenBridgePackageId}::coin_utils::return_nonzero`,
+      arguments: [dust],
+      typeArguments: [coinType],
+    });
+    const [messageTicket] = tx.moveCall({
+      target: `${tokenBridgePackageId}::transfer_tokens::transfer_tokens`,
+      arguments: [tx.object(tokenBridgeStateObjectId), transferTicket],
+      typeArguments: [coinType],
+    });
+    tx.moveCall({
+      target: `${coreBridgePackageId}::publish_message::publish_message`,
+      arguments: [
+        tx.object(coreBridgeStateObjectId),
+        feeCoin,
+        messageTicket,
+        tx.object(SUI_CLOCK_OBJECT_ID),
+      ],
+    });
+    return tx;
+  } else {
+    if (!emitterCapObjectId) {
+      throw new Error(
+        "emitterCapObjectId is required for transfer with payload"
+      );
+    }
+    const [transferTicket, dust] = tx.moveCall({
+      target: `${tokenBridgePackageId}::transfer_tokens_with_payload::prepare_transfer`,
+      arguments: [
+        tx.object(emitterCapObjectId),
+        assetInfo,
+        transferCoin,
+        tx.pure(coalesceChainId(recipientChain)),
+        tx.pure([...recipient]),
+        tx.pure([...payload]),
+        tx.pure(createNonce().readUInt32LE()),
+      ],
+      typeArguments: [coinType],
+    });
+    tx.moveCall({
+      target: `${tokenBridgePackageId}::coin_utils::return_nonzero`,
+      arguments: [dust],
+      typeArguments: [coinType],
+    });
+    const [messageTicket] = tx.moveCall({
+      target: `${tokenBridgePackageId}::transfer_tokens_with_payload::transfer_tokens_with_payload`,
+      arguments: [tx.object(tokenBridgeStateObjectId), transferTicket],
+      typeArguments: [coinType],
+    });
+    tx.moveCall({
+      target: `${coreBridgePackageId}::publish_message::publish_message`,
+      arguments: [
+        tx.object(coreBridgeStateObjectId),
+        feeCoin,
+        messageTicket,
+        tx.object(SUI_CLOCK_OBJECT_ID),
+      ],
+    });
+    return tx;
+  }
 }
