@@ -558,6 +558,7 @@ func (g *G) Run(rootCtxCancel context.CancelFunc, options ...*GuardianOption) su
 			g.gov,
 			g.acct,
 			g.acctC.readC,
+			1.0, // processorWorkerFactor TODO: make this configurable, requires creating GuardianOptionProcessor.
 		).Run); err != nil {
 			logger.Fatal("failed to start processor", zap.Error(err))
 		}

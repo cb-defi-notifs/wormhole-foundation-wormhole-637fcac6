@@ -145,9 +145,11 @@ spec:
             # - --solanaRPC
             # - http://solana-devnet:8899
             - --pythnetContract
-            - Bridge1p5gheXUvJ6jGWGeCsgPKgnE3YgdGKRVCMY9o
-            # - --pythnetRPC
-            # - http://solana-devnet:8899
+            - H3fxXJ86ADW2PNuDDmZJg6mzTtPxkYCpNuQUTgmJ7AjU
+            - --pythnetRPC
+            - http://pythnet.rpcpool.com
+            # - --pythnetWS
+            # - wss://pythnet.rpcpool.com
             - --unsafeDevMode
             - --guardianKey
             - /tmp/bridge.key
@@ -163,6 +165,8 @@ spec:
             - /tmp/data
             - --publicRpcLogDetail
             - "full"
+            - --logLevel
+            - "debug"
           # - --chainGovernorEnabled=true
           securityContext:
             capabilities:
