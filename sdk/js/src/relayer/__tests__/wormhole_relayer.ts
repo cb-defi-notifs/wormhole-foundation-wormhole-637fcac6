@@ -133,6 +133,9 @@ const getStatus = async (
   txHash: string,
   _sourceChain?: ChainName
 ): Promise<string> => {
+  const wormholeRelayerAddresses = new Map<ChainName, string>();
+  wormholeRelayerAddresses.set(sourceChain, source.wormholeRelayerAddress);
+  wormholeRelayerAddresses.set(targetChain, target.wormholeRelayerAddress);
   const info = (await relayer.getWormholeRelayerInfo(
     _sourceChain || sourceChain,
     txHash,
@@ -140,6 +143,7 @@ const getStatus = async (
       environment: network,
       targetChainProviders: myMap,
       sourceChainProvider: myMap.get(_sourceChain || sourceChain),
+      wormholeRelayerAddresses
     }
   )) as relayer.DeliveryInfo;
   return info.targetChainStatus.events[0].status;
