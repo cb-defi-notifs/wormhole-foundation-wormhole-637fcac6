@@ -129,13 +129,15 @@ const REASONABLE_GAS_LIMIT = 500000;
 const TOO_LOW_GAS_LIMIT = 10000;
 const REASONABLE_GAS_LIMIT_FORWARDS = 900000;
 
+const wormholeRelayerAddresses = new Map<ChainName, string>();
+  wormholeRelayerAddresses.set(sourceChain, source.wormholeRelayerAddress);
+  wormholeRelayerAddresses.set(targetChain, target.wormholeRelayerAddress);
+
 const getStatus = async (
   txHash: string,
   _sourceChain?: ChainName
 ): Promise<string> => {
-  const wormholeRelayerAddresses = new Map<ChainName, string>();
-  wormholeRelayerAddresses.set(sourceChain, source.wormholeRelayerAddress);
-  wormholeRelayerAddresses.set(targetChain, target.wormholeRelayerAddress);
+  
   const info = (await relayer.getWormholeRelayerInfo(
     _sourceChain || sourceChain,
     txHash,
@@ -426,7 +428,7 @@ describe("Wormhole Relayer Tests", () => {
     const info = (await relayer.getWormholeRelayerInfo(
       sourceChain,
       tx.hash,
-      optionalParams
+      {wormholeRelayerAddresses, ...optionalParams}
     )) as relayer.DeliveryInfo;
 
     await waitForRelay();
@@ -498,7 +500,7 @@ describe("Wormhole Relayer Tests", () => {
     const info = (await relayer.getWormholeRelayerInfo(
       sourceChain,
       rx.transactionHash,
-      optionalParams
+      {wormholeRelayerAddresses, ...optionalParams}
     )) as relayer.DeliveryInfo;
 
     console.log("Redelivering message");
@@ -522,7 +524,8 @@ describe("Wormhole Relayer Tests", () => {
         value: value,
         gasLimit: REASONABLE_GAS_LIMIT,
       },
-      { transport: NodeHttpTransport() }
+      { transport: NodeHttpTransport() },
+      {wormholeRelayerAddress: source.wormholeRelayerAddress}
     );
 
     console.log("redelivery tx:", redeliveryReceipt.hash);
