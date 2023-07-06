@@ -42,6 +42,7 @@ export type InfoRequestParams = {
 export type GetPriceOptParams = {
   environment?: Network;
   receiverValue?: ethers.BigNumberish;
+  wormholeRelayerAddress?: string;
   deliveryProviderAddress?: string;
   sourceChainProvider?: ethers.providers.Provider;
 };
@@ -60,7 +61,7 @@ export async function getPriceAndRefundInfo(
     throw Error(
       "No default RPC for this chain; pass in your own provider (as sourceChainProvider)"
     );
-  const wormholeRelayerAddress = getWormholeRelayerAddress(
+  const wormholeRelayerAddress = optionalParams?.wormholeRelayerAddress || getWormholeRelayerAddress(
     sourceChain,
     environment
   );

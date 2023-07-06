@@ -108,11 +108,13 @@ const optionalParams = {
   environment: network,
   sourceChainProvider: source.provider,
   targetChainProviders: myMap,
+  wormholeRelayerAddress: source.wormholeRelayerAddress
 };
 const optionalParamsTarget = {
   environment: network,
   sourceChainProvider: target.provider,
   targetChainProviders: myMap,
+  wormholeRelayerAddress: target.wormholeRelayerAddress
 };
 
 // for signing wormhole messages
