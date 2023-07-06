@@ -394,7 +394,7 @@ jobs:
         uses: actions/checkout@v2
       - run: chmod 755 ./scripts/check-npm-package-scopes.sh
       - run: ./scripts/check-npm-package-scopes.sh
-  format:
+  prettier:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
