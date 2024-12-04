@@ -31,10 +31,21 @@ func (d *MockAccountantDB) AcctGetData(logger *zap.Logger) ([]*common.MessagePub
 	return nil, nil
 }
 
-const acctPendingTransfer = "ACCT:PXFER:"
+const acctOldPendingTransfer = "ACCT:PXFER:"
+const acctOldPendingTransferLen = len(acctOldPendingTransfer)
+
+const acctPendingTransfer = "ACCT:PXFER2:"
 const acctPendingTransferLen = len(acctPendingTransfer)
 
 const acctMinMsgIdLen = len("1/0000000000000000000000000290fb167208af455bb137780163b7b7a9a10c16/0")
+
+func acctOldPendingTransferMsgID(msgId string) []byte {
+	return []byte(fmt.Sprintf("%v%v", acctOldPendingTransfer, msgId))
+}
+
+func acctIsOldPendingTransfer(keyBytes []byte) bool {
+	return (len(keyBytes) >= acctOldPendingTransferLen+acctMinMsgIdLen) && (string(keyBytes[0:acctOldPendingTransferLen]) == acctOldPendingTransfer)
+}
 
 func acctPendingTransferMsgID(msgId string) []byte {
 	return []byte(fmt.Sprintf("%v%v", acctPendingTransfer, msgId))
@@ -47,36 +58,86 @@ func acctIsPendingTransfer(keyBytes []byte) bool {
 // This is called by the accountant on start up to reload pending transfers.
 func (d *Database) AcctGetData(logger *zap.Logger) ([]*common.MessagePublication, error) {
 	pendingTransfers := []*common.MessagePublication{}
-	prefixBytes := []byte(acctPendingTransfer)
-	err := d.db.View(func(txn *badger.Txn) error {
-		opts := badger.DefaultIteratorOptions
-		opts.PrefetchSize = 10
-		it := txn.NewIterator(opts)
-		defer it.Close()
-		for it.Seek(prefixBytes); it.ValidForPrefix(prefixBytes); it.Next() {
-			item := it.Item()
-			key := item.Key()
-			val, err := item.ValueCopy(nil)
-			if err != nil {
-				return err
-			}
-
-			if acctIsPendingTransfer(key) {
-				var pt common.MessagePublication
-				err := json.Unmarshal(val, &pt)
+	var err error
+	{
+		prefixBytes := []byte(acctPendingTransfer)
+		err = d.db.View(func(txn *badger.Txn) error {
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchSize = 10
+			it := txn.NewIterator(opts)
+			defer it.Close()
+			for it.Seek(prefixBytes); it.ValidForPrefix(prefixBytes); it.Next() {
+				item := it.Item()
+				key := item.Key()
+				val, err := item.ValueCopy(nil)
 				if err != nil {
-					logger.Error("failed to unmarshal pending transfer for key", zap.String("key", string(key[:])), zap.Error(err))
-					continue
+					return err
 				}
 
-				pendingTransfers = append(pendingTransfers, &pt)
-			} else {
-				return fmt.Errorf("unexpected accountant pending transfer key '%s'", string(key))
+				if acctIsPendingTransfer(key) {
+					var pt common.MessagePublication
+					err := json.Unmarshal(val, &pt)
+					if err != nil {
+						logger.Error("failed to unmarshal pending transfer for key", zap.String("key", string(key[:])), zap.Error(err))
+						continue
+					}
+
+					pendingTransfers = append(pendingTransfers, &pt)
+				} else {
+					return fmt.Errorf("unexpected accountant pending transfer key '%s'", string(key))
+				}
+			}
+
+			return nil
+		})
+	}
+
+	// Any pending transfers in the old format are long since obsolete. Just delete them.
+	if err == nil {
+		oldPendingTransfers := []string{}
+		prefixBytes := []byte(acctOldPendingTransfer)
+		err = d.db.View(func(txn *badger.Txn) error {
+			opts := badger.DefaultIteratorOptions
+			opts.PrefetchSize = 10
+			it := txn.NewIterator(opts)
+			defer it.Close()
+			for it.Seek(prefixBytes); it.ValidForPrefix(prefixBytes); it.Next() {
+				item := it.Item()
+				key := item.Key()
+				val, err := item.ValueCopy(nil)
+				if err != nil {
+					return err
+				}
+
+				if acctIsOldPendingTransfer(key) {
+					pt, err := common.UnmarshalOldMessagePublicationBeforeIsReobservation(val)
+					if err != nil {
+						logger.Error("failed to unmarshal old pending transfer for key", zap.String("key", string(key[:])), zap.Error(err))
+						continue
+					}
+
+					oldPendingTransfers = append(oldPendingTransfers, pt.MessageIDString())
+				} else {
+					return fmt.Errorf("unexpected accountant pending transfer key '%s'", string(key))
+				}
+			}
+
+			return nil
+		})
+
+		if err == nil && len(oldPendingTransfers) != 0 {
+			for _, pt := range oldPendingTransfers {
+				key := acctOldPendingTransferMsgID(pt)
+				logger.Info("deleting obsolete pending transfer", zap.String("msgId", pt), zap.String("key", string(key)))
+				if err := d.db.Update(func(txn *badger.Txn) error {
+					err := txn.Delete(key)
+					return err
+				}); err != nil {
+					return pendingTransfers, fmt.Errorf("failed to delete old pending msg for key [%v]: %w", pt, err)
+				}
 			}
 		}
-
-		return nil
-	})
+	}
 
 	return pendingTransfers, err
 }

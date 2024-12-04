@@ -49,11 +49,7 @@ build: forge_dependencies node_modules ${SOURCE_FILES}
 	
 
 flattened/%.sol: contracts/%.sol node_modules
-	@mkdir -p $(dir $@)
-    # We remove the license (SPDX) lines and ABIEncoderV2 lines because they
-    # break compilation in the flattened file if there are multiple conflicting
-    # declarations.
-	npx truffle-flattener $< | grep -v SPDX | grep -v ABIEncoderV2 > $@
+	./sh/flatten.sh
 
 .PHONY: flattened
 flattened: $(patsubst contracts/%, flattened/%, $(FLATTEN_FILES))
@@ -61,15 +57,7 @@ flattened: $(patsubst contracts/%, flattened/%, $(FLATTEN_FILES))
 .env: .env.test
 	cp $< $@
 
-test: test-forge test-identifiers test-ganache
-
-.PHONY: test-ganache
-test-ganache: build .env dependencies
-	@if pgrep ganache-cli; then echo "Error: ganache-cli already running. Stop it before running tests"; exit 1; fi
-	. ./.env && npx ganache-cli --chain.vmErrorsOnRPCResponse --chain.chainId $$INIT_EVM_CHAIN_ID --wallet.defaultBalance 10000 --wallet.deterministic --chain.time="1970-01-01T00:00:00+00:00" --chain.asyncRequestProcessing=false > ganache.log &
-	sleep 5
-	npm test || (pkill ganache-cli && exit 1)
-	pkill ganache-cli || true
+test: test-forge test-identifiers
 
 .PHONY: test-upgrade
 test-upgrade: build .env node_modules
@@ -83,7 +71,12 @@ test-identifiers: dependencies
 
 .PHONY:
 test-forge: dependencies
-	forge test
+	forge test --no-match-test .*_KEVM # ignore KEVM tests (see PROOFS.md)
+
+# Verify that the contracts do not include PUSH0 opcodes
+test-push0: dependencies
+	forge build --extra-output evm.bytecode.opcodes
+	@if grep -qr --include \*.json PUSH0 ./build-forge; then echo "Contract uses PUSH0 instruction" 1>&2; exit 1; fi
 
 clean:
-	rm -rf ganache.log .env node_modules build flattened build-forge ethers-contracts lib/forge-std lib/openzeppelin-contracts
+	rm -rf .env node_modules build flattened build-forge ethers-contracts lib/forge-std lib/openzeppelin-contracts

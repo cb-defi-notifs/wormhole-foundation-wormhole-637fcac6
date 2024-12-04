@@ -3,28 +3,28 @@
 // take a guardian secret as input.
 //
 // Sign a VAA using signatures from wormscan:
-//   worm edit-vaa -n mainnet --vaa $VAA --wormscanurl https://api.wormscan.io/api/v1/observations/1/0000000000000000000000000000000000000000000000000000000000000004/651169458827220885
+//   worm edit-vaa -n mainnet --vaa $VAA --wormscanurl https://api.wormholescan.io/api/v1/observations/1/0000000000000000000000000000000000000000000000000000000000000004/651169458827220885
 //
 // Create the same VAA from scratch:
 //   worm edit-vaa -n mainnet \
 //     --ec 1 --ea 0x0000000000000000000000000000000000000000000000000000000000000004 \
 //     --gsi 3 --sequence 651169458827220885 --nonce 2166843495 --cl 32 \
 //     --payload 000000000000000000000000000000436972636c65496e746567726174696f6e020002000600000000000000000000000009fb06a271faff70a651047395aaeb6265265f1300000001 \
-//     --wormscanurl https://api.wormscan.io/api/v1/observations/1/0000000000000000000000000000000000000000000000000000000000000004/651169458827220885
+//     --wormscanurl https://api.wormholescan.io/api/v1/observations/1/0000000000000000000000000000000000000000000000000000000000000004/651169458827220885
 //
 // Sign a VAA using the testnet guardian key:
 //   worm edit-vaa --vaa $VAA --gs $TESTNET_GUARDIAN_SECRET
 //
 
 import { Implementation__factory } from "@certusone/wormhole-sdk/lib/esm/ethers-contracts";
-import { CONTRACTS } from "@certusone/wormhole-sdk/lib/esm/utils/consts";
 import { Other } from "@certusone/wormhole-sdk/lib/esm/vaa";
 import axios from "axios";
 import { ethers } from "ethers";
 import yargs from "yargs";
 import { NETWORK_OPTIONS, NETWORKS } from "../consts";
-import { assertNetwork, Network } from "../utils";
 import { parse, Payload, serialiseVAA, sign, Signature, VAA } from "../vaa";
+import { contracts, Network } from "@wormhole-foundation/sdk-base";
+import { getNetwork } from "../utils";
 
 export const command = "edit-vaa";
 export const desc = "Edits or generates a VAA";
@@ -52,11 +52,11 @@ export const builder = (y: typeof yargs) =>
       describe: "url to wormscan entry for the vaa that includes signatures",
       type: "string",
     })
-    .option("wormscanfile", {
-      alias: "wsf",
+    .option("wormscan", {
+      alias: "ws",
       describe:
-        "json file containing wormscan entry for the vaa that includes signatures",
-      type: "string",
+        "if specified, will query the wormscan entry for the vaa to get the signatures",
+      type: "boolean",
     })
     .option("emitter-chain-id", {
       alias: "ec",
@@ -102,15 +102,14 @@ export const builder = (y: typeof yargs) =>
 export const handler = async (
   argv: Awaited<ReturnType<typeof builder>["argv"]>
 ) => {
-  const network = argv.network.toUpperCase();
-  assertNetwork(network);
+  const network = getNetwork(argv.network);
 
   let numSigs = 0;
   if (argv.signatures) {
     numSigs += 1;
   }
 
-  if (argv.wormscanfile) {
+  if (argv.wormscan) {
     numSigs += 1;
   }
 
@@ -124,7 +123,7 @@ export const handler = async (
 
   if (numSigs > 1) {
     throw new Error(
-      `may only specify one of "--signatures", "--wormscanfile", "--wormscanurl" or "--guardian-secret"`
+      `may only specify one of "--signatures", "--wormscan", "--wormscanurl" or "--guardian-secret"`
     );
   }
 
@@ -170,10 +169,20 @@ export const handler = async (
       signature: s,
       guardianSetIndex: i,
     }));
-  } else if (argv.wormscanfile) {
-    const wormscanData = require(argv.wormscanfile);
+  } else if (argv.wormscan) {
+    const wormscanurl =
+      "https://api.wormholescan.io/api/v1/observations/" +
+      vaa.emitterChain.toString() +
+      "/" +
+      vaa.emitterAddress.replace(/^(0x)/, "") +
+      "/" +
+      vaa.sequence.toString();
+    const wormscanData = await axios.get(wormscanurl);
     const guardianSet = await getGuardianSet(network, vaa.guardianSetIndex);
-    vaa.signatures = await getSigsFromWormscanData(wormscanData, guardianSet);
+    vaa.signatures = await getSigsFromWormscanData(
+      wormscanData.data,
+      guardianSet
+    );
   } else if (argv.wormscanurl) {
     const wormscanData = await axios.get(argv.wormscanurl);
     const guardianSet = await getGuardianSet(network, vaa.guardianSetIndex);
@@ -225,8 +234,8 @@ const getGuardianSet = async (
   network: Network,
   guardianSetIndex: number
 ): Promise<string[]> => {
-  let n = NETWORKS[network].ethereum;
-  let contract_address = CONTRACTS[network].ethereum.core;
+  let n = NETWORKS[network].Ethereum;
+  let contract_address = contracts.coreBridge(network, "Ethereum");
   if (contract_address === undefined) {
     throw Error(`Unknown core contract on ${network} for ethereum`);
   }
@@ -254,7 +263,10 @@ const getSigsFromWormscanData = (
       }
     }
     if (gsi < 0) {
-      throw new Error("Failed to look up guardian address " + guardianAddr);
+      console.warn(
+        "Failed to look up guardian address " + guardianAddr + ". Skipping."
+      );
+      continue;
     }
     let sig: Signature = {
       guardianSetIndex: gsi,

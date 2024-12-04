@@ -1,6 +1,7 @@
 import { ethers, BigNumber } from "ethers";
 import { ethers_contracts } from "../..";
-import { VaaKeyStruct } from "../../ethers-contracts/MockRelayerIntegration";
+import { VaaKeyStruct } from "../../ethers-relayer-contracts/MockRelayerIntegration";
+import { IWormholeRelayer__factory } from "../../ethers-relayer-contracts";
 import {
   ChainId,
   ChainName,
@@ -22,6 +23,7 @@ export type SendOptionalParams = {
     }
   ];
   deliveryProviderAddress?: string;
+  wormholeRelayerAddress?: string;
   consistencyLevel?: ethers.BigNumberish;
   refundChainId?: ChainId;
   refundAddress?: string;
@@ -42,15 +44,13 @@ export async function sendToEvm(
   const targetChainId = CHAINS[targetChain];
 
   const environment = sendOptionalParams?.environment || "MAINNET";
-  const wormholeRelayerAddress = getWormholeRelayerAddress(
-    sourceChain,
-    environment
+  const wormholeRelayerAddress =
+    sendOptionalParams?.wormholeRelayerAddress ||
+    getWormholeRelayerAddress(sourceChain, environment);
+  const sourceWormholeRelayer = IWormholeRelayer__factory.connect(
+    wormholeRelayerAddress,
+    signer
   );
-  const sourceWormholeRelayer =
-    ethers_contracts.IWormholeRelayer__factory.connect(
-      wormholeRelayerAddress,
-      signer
-    );
 
   const refundLocationExists =
     sendOptionalParams?.refundChainId !== undefined &&
@@ -80,7 +80,9 @@ export async function sendToEvm(
       `Expected a payment of ${totalPrice.toString()} wei; received ${value.toString()} wei`
     );
   }
-  const tx = sourceWormholeRelayer.sendToEvm(
+  const tx = sourceWormholeRelayer[
+    "sendToEvm(uint16,address,bytes,uint256,uint256,uint256,uint16,address,address,(uint16,bytes32,uint64)[],uint8)"
+  ](
     targetChainId, // targetChainId
     targetAddress, // targetAddress
     payload,

@@ -1,7 +1,7 @@
 package keeper
 
 import (
-	"io/ioutil"
+	"os"
 	"testing"
 	"time"
 
@@ -97,10 +97,7 @@ func WormholeKeeperAndWasmd(t testing.TB) (*keeper.Keeper, wasmkeeper.Keeper, *w
 	appapp.CapabilityKeeper = capabilitykeeper.NewKeeper(appCodec, keys[capabilitytypes.StoreKey], memKeys[capabilitytypes.MemStoreKey])
 	scopedWasmKeeper := appapp.CapabilityKeeper.ScopeToModule(wasm.ModuleName)
 
-	wasmDir, err := ioutil.TempDir("", "")
-	if err != nil {
-		panic(err)
-	}
+	wasmDir := os.TempDir()
 	wasmKeeper := wasm.NewKeeper(
 		appCodec,
 		keys[wasmtypes.StoreKey],
@@ -113,6 +110,7 @@ func WormholeKeeperAndWasmd(t testing.TB) (*keeper.Keeper, wasmkeeper.Keeper, *w
 		&wasm_handlers.PortKeeperHandler{},
 		scopedWasmKeeper,
 		&wasm_handlers.ICS20TransferPortSourceHandler{},
+		appapp.WormholeKeeper,
 		appapp.MsgServiceRouter(),
 		appapp.GRPCQueryRouter(),
 		wasmDir,

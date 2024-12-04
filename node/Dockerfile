@@ -1,13 +1,8 @@
 # syntax=docker.io/docker/dockerfile:1.3@sha256:42399d4635eddd7a9b8a24be879d2f9a930d0ed040a61324cfdf59ef1357b3b2
-FROM --platform=linux/amd64 docker.io/golang:1.20.5@sha256:4b1fc02d16fca272e5e6e6adc98396219b43ef663a377eef4a97e881d364393f AS build
+FROM --platform=linux/amd64 docker.io/golang:1.23.3-bullseye@sha256:bc1b90c2a8eb0ffb62325e02a85d51031ad3afae15b3df4b6a48b7929b00badb AS dev
 # libwasmvm.so is not compatible with arm
 
-# Support additional root CAs
-COPY node/go.mod cert.pem* /certs/
-# Debian
-RUN if [ -e /certs/cert.pem ]; then cp /certs/cert.pem /etc/ssl/certs/ca-certificates.crt; fi
-# git
-RUN if [ -e /certs/cert.pem ]; then git config --global http.sslCAInfo /certs/cert.pem; fi
+FROM dev AS build
 
 WORKDIR /app
 
@@ -23,6 +18,7 @@ COPY wormchain wormchain
 ARG GO_BUILD_ARGS=-race
 
 RUN --mount=type=cache,target=/root/.cache --mount=type=cache,target=/go \
+  export CGO_ENABLED=1 && \
   cd node && \
   go build ${GO_BUILD_ARGS} -gcflags="all=-N -l" --ldflags '-extldflags "-Wl,--allow-multiple-definition" -X "github.com/certusone/wormhole/node/cmd/guardiand.Build=dev"' -mod=readonly -o /guardiand github.com/certusone/wormhole/node && \
   go get github.com/CosmWasm/wasmvm@v1.1.1 && \

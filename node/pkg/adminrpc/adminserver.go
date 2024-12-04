@@ -3,27 +3,33 @@ package adminrpc
 import (
 	"bytes"
 	"context"
-	"crypto/ecdsa"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"math/big"
 	"math/rand"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/certusone/wormhole/node/pkg/guardiansigner"
 	"github.com/certusone/wormhole/node/pkg/watchers/evm/connectors"
 	"github.com/holiman/uint256"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/promauto"
 	"golang.org/x/exp/slices"
 
 	"github.com/certusone/wormhole/node/pkg/db"
 	"github.com/certusone/wormhole/node/pkg/governor"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	ethcommon "github.com/ethereum/go-ethereum/common"
+	"github.com/mr-tron/base58"
 	"go.uber.org/zap"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -31,32 +37,45 @@ import (
 	"github.com/certusone/wormhole/node/pkg/common"
 	nodev1 "github.com/certusone/wormhole/node/pkg/proto/node/v1"
 	"github.com/wormhole-foundation/wormhole/sdk/vaa"
+
+	sdktypes "github.com/cosmos/cosmos-sdk/types"
+)
+
+const maxResetReleaseTimerDays = 7
+const ecdsaSignatureLength = 65
+
+var (
+	vaaInjectionsTotal = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "wormhole_vaa_injections_total",
+			Help: "Total number of injected VAA queued for broadcast",
+		})
 )
 
 type nodePrivilegedService struct {
 	nodev1.UnimplementedNodePrivilegedServiceServer
 	db              *db.Database
-	injectC         chan<- *vaa.VAA
+	injectC         chan<- *common.MessagePublication
 	obsvReqSendC    chan<- *gossipv1.ObservationRequest
 	logger          *zap.Logger
 	signedInC       chan<- *gossipv1.SignedVAAWithQuorum
 	governor        *governor.ChainGovernor
 	evmConnector    connectors.Connector
 	gsCache         sync.Map
-	gk              *ecdsa.PrivateKey
+	guardianSigner  guardiansigner.GuardianSigner
 	guardianAddress ethcommon.Address
 	rpcMap          map[string]string
 }
 
 func NewPrivService(
 	db *db.Database,
-	injectC chan<- *vaa.VAA,
+	injectC chan<- *common.MessagePublication,
 	obsvReqSendC chan<- *gossipv1.ObservationRequest,
 	logger *zap.Logger,
 	signedInC chan<- *gossipv1.SignedVAAWithQuorum,
 	governor *governor.ChainGovernor,
 	evmConnector connectors.Connector,
-	gk *ecdsa.PrivateKey,
+	guardianSigner guardiansigner.GuardianSigner,
 	guardianAddress ethcommon.Address,
 	rpcMap map[string]string,
 
@@ -69,7 +88,7 @@ func NewPrivService(
 		signedInC:       signedInC,
 		governor:        governor,
 		evmConnector:    evmConnector,
-		gk:              gk,
+		guardianSigner:  guardianSigner,
 		guardianAddress: guardianAddress,
 		rpcMap:          rpcMap,
 	}
@@ -102,12 +121,16 @@ func adminGuardianSetUpdateToVAA(req *nodev1.GuardianSetUpdate, timestamp time.T
 		addrs[i] = ethAddr
 	}
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyGuardianSetUpdate{
-			Keys:     addrs,
-			NewIndex: guardianSetIndex + 1,
-		}.Serialize())
+	body, err := vaa.BodyGuardianSetUpdate{
+		Keys:     addrs,
+		NewIndex: guardianSetIndex + 1,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -130,12 +153,16 @@ func adminContractUpgradeToVAA(req *nodev1.ContractUpgrade, timestamp time.Time,
 	newContractAddress := vaa.Address{}
 	copy(newContractAddress[:], b)
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyContractUpgrade{
-			ChainID:     vaa.ChainID(req.ChainId),
-			NewContract: newContractAddress,
-		}.Serialize())
+	body, err := vaa.BodyContractUpgrade{
+		ChainID:     vaa.ChainID(req.ChainId),
+		NewContract: newContractAddress,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -158,13 +185,50 @@ func tokenBridgeRegisterChain(req *nodev1.BridgeRegisterChain, timestamp time.Ti
 	emitterAddress := vaa.Address{}
 	copy(emitterAddress[:], b)
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyTokenBridgeRegisterChain{
-			Module:         req.Module,
-			ChainID:        vaa.ChainID(req.ChainId),
-			EmitterAddress: emitterAddress,
-		}.Serialize())
+	body, err := vaa.BodyTokenBridgeRegisterChain{
+		Module:         req.Module,
+		ChainID:        vaa.ChainID(req.ChainId),
+		EmitterAddress: emitterAddress,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
+	return v, nil
+}
+
+// recoverChainId converts a nodev1.RecoverChainId message to its canonical VAA representation.
+// Returns an error if the data is invalid.
+func recoverChainId(req *nodev1.RecoverChainId, timestamp time.Time, guardianSetIndex uint32, nonce uint32, sequence uint64) (*vaa.VAA, error) {
+	evm_chain_id_big := big.NewInt(0)
+	evm_chain_id_big, ok := evm_chain_id_big.SetString(req.EvmChainId, 10)
+	if !ok {
+		return nil, errors.New("invalid evm_chain_id")
+	}
+
+	// uint256 has Bytes32 method for easier serialization
+	evm_chain_id, overflow := uint256.FromBig(evm_chain_id_big)
+	if overflow {
+		return nil, errors.New("evm_chain_id overflow")
+	}
+
+	if req.NewChainId > math.MaxUint16 {
+		return nil, errors.New("invalid new_chain_id")
+	}
+
+	body, err := vaa.BodyRecoverChainId{
+		Module:     req.Module,
+		EvmChainID: evm_chain_id,
+		NewChainID: vaa.ChainID(req.NewChainId),
+	}.Serialize()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -190,8 +254,8 @@ func accountantModifyBalance(req *nodev1.AccountantModifyBalance, timestamp time
 		return nil, errors.New("invalid new token address (expected 32 bytes)")
 	}
 
-	if len(req.Reason) > 32 {
-		return nil, errors.New("the reason should not be larger than 32 bytes")
+	if len(req.Reason) > vaa.AccountantModifyBalanceReasonLength {
+		return nil, fmt.Errorf("the reason should not be larger than %d bytes", vaa.AccountantModifyBalanceReasonLength)
 	}
 
 	amount_big := big.NewInt(0)
@@ -209,20 +273,24 @@ func accountantModifyBalance(req *nodev1.AccountantModifyBalance, timestamp time
 	tokenAdress := vaa.Address{}
 	copy(tokenAdress[:], b)
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyAccountantModifyBalance{
-			Module:        req.Module,
-			TargetChainID: vaa.ChainID(req.TargetChainId),
+	body, err := vaa.BodyAccountantModifyBalance{
+		Module:        req.Module,
+		TargetChainID: vaa.ChainID(req.TargetChainId),
 
-			Sequence:     req.Sequence,
-			ChainId:      vaa.ChainID(req.ChainId),
-			TokenChain:   vaa.ChainID(req.TokenChain),
-			TokenAddress: tokenAdress,
-			Kind:         uint8(req.Kind),
-			Amount:       amount,
-			Reason:       req.Reason,
-		}.Serialize())
+		Sequence:     req.Sequence,
+		ChainId:      vaa.ChainID(req.ChainId),
+		TokenChain:   vaa.ChainID(req.TokenChain),
+		TokenAddress: tokenAdress,
+		Kind:         uint8(req.Kind),
+		Amount:       amount,
+		Reason:       req.Reason,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -245,13 +313,17 @@ func tokenBridgeUpgradeContract(req *nodev1.BridgeUpgradeContract, timestamp tim
 	newContract := vaa.Address{}
 	copy(newContract[:], b)
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyTokenBridgeUpgradeContract{
-			Module:        req.Module,
-			TargetChainID: vaa.ChainID(req.TargetChainId),
-			NewContract:   newContract,
-		}.Serialize())
+	body, err := vaa.BodyTokenBridgeUpgradeContract{
+		Module:        req.Module,
+		TargetChainID: vaa.ChainID(req.TargetChainId),
+		NewContract:   newContract,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -271,11 +343,15 @@ func wormchainStoreCode(req *nodev1.WormchainStoreCode, timestamp time.Time, gua
 	wasmHash := [32]byte{}
 	copy(wasmHash[:], b)
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyWormchainStoreCode{
-			WasmHash: wasmHash,
-		}.Serialize())
+	body, err := vaa.BodyWormchainStoreCode{
+		WasmHash: wasmHash,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -284,11 +360,15 @@ func wormchainStoreCode(req *nodev1.WormchainStoreCode, timestamp time.Time, gua
 func wormchainInstantiateContract(req *nodev1.WormchainInstantiateContract, timestamp time.Time, guardianSetIndex uint32, nonce uint32, sequence uint64) (*vaa.VAA, error) { //nolint:unparam // error is always nil but kept to mirror function signature of other functions
 	instantiationParams_hash := vaa.CreateInstatiateCosmwasmContractHash(req.CodeId, req.Label, []byte(req.InstantiationMsg))
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyWormchainInstantiateContract{
-			InstantiationParamsHash: instantiationParams_hash,
-		}.Serialize())
+	body, err := vaa.BodyWormchainInstantiateContract{
+		InstantiationParamsHash: instantiationParams_hash,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -296,11 +376,117 @@ func wormchainInstantiateContract(req *nodev1.WormchainInstantiateContract, time
 func wormchainMigrateContract(req *nodev1.WormchainMigrateContract, timestamp time.Time, guardianSetIndex uint32, nonce uint32, sequence uint64) (*vaa.VAA, error) { //nolint:unparam // error is always nil but kept to mirror function signature of other functions
 	instantiationParams_hash := vaa.CreateMigrateCosmwasmContractHash(req.CodeId, req.Contract, []byte(req.InstantiationMsg))
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyWormchainMigrateContract{
-			MigrationParamsHash: instantiationParams_hash,
-		}.Serialize())
+	body, err := vaa.BodyWormchainMigrateContract{
+		MigrationParamsHash: instantiationParams_hash,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
+	return v, nil
+}
+
+func wormchainWasmInstantiateAllowlist(
+	req *nodev1.WormchainWasmInstantiateAllowlist,
+	timestamp time.Time,
+	guardianSetIndex uint32,
+	nonce uint32,
+	sequence uint64,
+) (*vaa.VAA, error) { //nolint:unparam // error is always nil but kept to mirror function signature of other functions
+	decodedAddr, err := sdktypes.GetFromBech32(req.Contract, "wormhole")
+	if err != nil {
+		return nil, err
+	}
+
+	var action vaa.GovernanceAction
+	if req.Action == nodev1.WormchainWasmInstantiateAllowlistAction_WORMCHAIN_WASM_INSTANTIATE_ALLOWLIST_ACTION_ADD {
+		action = vaa.ActionAddWasmInstantiateAllowlist
+	} else if req.Action == nodev1.WormchainWasmInstantiateAllowlistAction_WORMCHAIN_WASM_INSTANTIATE_ALLOWLIST_ACTION_DELETE {
+		action = vaa.ActionDeleteWasmInstantiateAllowlist
+	} else {
+		return nil, fmt.Errorf("unrecognized wasm instantiate allowlist action")
+	}
+
+	var decodedAddr32 [32]byte
+	copy(decodedAddr32[:], decodedAddr)
+
+	body, err := vaa.BodyWormchainWasmAllowlistInstantiate{
+		ContractAddr: decodedAddr32,
+		CodeId:       req.CodeId,
+	}.Serialize(action)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
+	return v, nil
+}
+
+func gatewayScheduleUpgrade(
+	req *nodev1.GatewayScheduleUpgrade,
+	timestamp time.Time,
+	guardianSetIndex uint32,
+	nonce uint32,
+	sequence uint64,
+) (*vaa.VAA, error) { //nolint:unparam // error is always nil but kept to mirror function signature of other functions
+
+	body, err := vaa.BodyGatewayScheduleUpgrade{
+		Name:   req.Name,
+		Height: req.Height,
+	}.Serialize()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
+	return v, nil
+}
+
+func gatewayCancelUpgrade(
+	timestamp time.Time,
+	guardianSetIndex uint32,
+	nonce uint32,
+	sequence uint64,
+) (*vaa.VAA, error) { //nolint:unparam // error is always nil but kept to mirror function signature of other functions
+
+	body, err := vaa.EmptyPayloadVaa(vaa.GatewayModuleStr, vaa.ActionCancelUpgrade, vaa.ChainIDWormchain)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
+	return v, nil
+}
+
+func gatewayIbcComposabilityMwSetContract(
+	req *nodev1.GatewayIbcComposabilityMwSetContract,
+	timestamp time.Time,
+	guardianSetIndex uint32,
+	nonce uint32,
+	sequence uint64,
+) (*vaa.VAA, error) {
+	decodedAddr, err := sdktypes.GetFromBech32(req.Contract, "wormhole")
+	if err != nil {
+		return nil, err
+	}
+
+	var decodedAddr32 [32]byte
+	copy(decodedAddr32[:], decodedAddr)
+
+	body, err := vaa.BodyGatewayIbcComposabilityMwContract{
+		ContractAddr: decodedAddr32,
+	}.Serialize()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -313,12 +499,17 @@ func circleIntegrationUpdateWormholeFinality(req *nodev1.CircleIntegrationUpdate
 	if req.Finality > math.MaxUint8 {
 		return nil, fmt.Errorf("invalid finality, must be <= %d", math.MaxUint8)
 	}
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyCircleIntegrationUpdateWormholeFinality{
-			TargetChainID: vaa.ChainID(req.TargetChainId),
-			Finality:      uint8(req.Finality),
-		}.Serialize())
 
+	body, err := vaa.BodyCircleIntegrationUpdateWormholeFinality{
+		TargetChainID: vaa.ChainID(req.TargetChainId),
+		Finality:      uint8(req.Finality),
+	}.Serialize()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -343,14 +534,18 @@ func circleIntegrationRegisterEmitterAndDomain(req *nodev1.CircleIntegrationRegi
 	foreignEmitterAddress := vaa.Address{}
 	copy(foreignEmitterAddress[:], b)
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyCircleIntegrationRegisterEmitterAndDomain{
-			TargetChainID:         vaa.ChainID(req.TargetChainId),
-			ForeignEmitterChainId: vaa.ChainID(req.ForeignEmitterChainId),
-			ForeignEmitterAddress: foreignEmitterAddress,
-			CircleDomain:          req.CircleDomain,
-		}.Serialize())
+	body, err := vaa.BodyCircleIntegrationRegisterEmitterAndDomain{
+		TargetChainID:         vaa.ChainID(req.TargetChainId),
+		ForeignEmitterChainId: vaa.ChainID(req.ForeignEmitterChainId),
+		ForeignEmitterAddress: foreignEmitterAddress,
+		CircleDomain:          req.CircleDomain,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -372,17 +567,21 @@ func circleIntegrationUpgradeContractImplementation(req *nodev1.CircleIntegratio
 	newImplementationAddress := vaa.Address{}
 	copy(newImplementationAddress[:], b)
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyCircleIntegrationUpgradeContractImplementation{
-			TargetChainID:            vaa.ChainID(req.TargetChainId),
-			NewImplementationAddress: newImplementationAddress,
-		}.Serialize())
+	body, err := vaa.BodyCircleIntegrationUpgradeContractImplementation{
+		TargetChainID:            vaa.ChainID(req.TargetChainId),
+		NewImplementationAddress: newImplementationAddress,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
-func ibcReceiverUpdateChannelChain(
-	req *nodev1.IbcReceiverUpdateChannelChain,
+func ibcUpdateChannelChain(
+	req *nodev1.IbcUpdateChannelChain,
 	timestamp time.Time,
 	guardianSetIndex uint32,
 	nonce uint32,
@@ -400,16 +599,31 @@ func ibcReceiverUpdateChannelChain(
 	if len(req.ChannelId) > 64 {
 		return nil, fmt.Errorf("invalid channel ID length, must be <= 64")
 	}
-	channelId := vaa.LeftPadIbcChannelId(req.ChannelId)
+	channelId, err := vaa.LeftPadIbcChannelId(req.ChannelId)
+	if err != nil {
+		return nil, fmt.Errorf("failed to left pad channel id: %w", err)
+	}
 
-	// create governance VAA
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyIbcReceiverUpdateChannelChain{
-			TargetChainId: vaa.ChainID(req.TargetChainId),
-			ChannelId:     channelId,
-			ChainId:       vaa.ChainID(req.ChainId),
-		}.Serialize())
+	var module string
+	if req.Module == nodev1.IbcUpdateChannelChainModule_IBC_UPDATE_CHANNEL_CHAIN_MODULE_RECEIVER {
+		module = vaa.IbcReceiverModuleStr
+	} else if req.Module == nodev1.IbcUpdateChannelChainModule_IBC_UPDATE_CHANNEL_CHAIN_MODULE_TRANSLATOR {
+		module = vaa.IbcTranslatorModuleStr
+	} else {
+		return nil, fmt.Errorf("unrecognized ibc update channel chain module")
+	}
 
+	body, err := vaa.BodyIbcUpdateChannelChain{
+		TargetChainId: vaa.ChainID(req.TargetChainId),
+		ChannelId:     channelId,
+		ChainId:       vaa.ChainID(req.ChainId),
+	}.Serialize(module)
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -432,12 +646,71 @@ func wormholeRelayerSetDefaultDeliveryProvider(req *nodev1.WormholeRelayerSetDef
 	NewDefaultDeliveryProviderAddress := vaa.Address{}
 	copy(NewDefaultDeliveryProviderAddress[:], b)
 
-	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex,
-		vaa.BodyWormholeRelayerSetDefaultDeliveryProvider{
-			ChainID:                           vaa.ChainID(req.ChainId),
-			NewDefaultDeliveryProviderAddress: NewDefaultDeliveryProviderAddress,
-		}.Serialize())
+	body, err := vaa.BodyWormholeRelayerSetDefaultDeliveryProvider{
+		ChainID:                           vaa.ChainID(req.ChainId),
+		NewDefaultDeliveryProviderAddress: NewDefaultDeliveryProviderAddress,
+	}.Serialize()
 
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
+	return v, nil
+}
+
+func evmCallToVaa(evmCall *nodev1.EvmCall, timestamp time.Time, guardianSetIndex, nonce uint32, sequence uint64) (*vaa.VAA, error) {
+	governanceContract := ethcommon.HexToAddress(evmCall.GovernanceContract)
+	targetContract := ethcommon.HexToAddress(evmCall.TargetContract)
+
+	payload, err := hex.DecodeString(evmCall.AbiEncodedCall)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode ABI encoded call: %w", err)
+	}
+
+	body, err := vaa.BodyGeneralPurposeGovernanceEvm{
+		ChainID:            vaa.ChainID(evmCall.ChainId),
+		GovernanceContract: governanceContract,
+		TargetContract:     targetContract,
+		Payload:            payload,
+	}.Serialize()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
+	return v, nil
+}
+
+func solanaCallToVaa(solanaCall *nodev1.SolanaCall, timestamp time.Time, guardianSetIndex, nonce uint32, sequence uint64) (*vaa.VAA, error) {
+	address, err := base58.Decode(solanaCall.GovernanceContract)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode base58 governance contract address: %w", err)
+	}
+	if len(address) != 32 {
+		return nil, errors.New("invalid governance contract address length (expected 32 bytes)")
+	}
+
+	var governanceContract [32]byte
+	copy(governanceContract[:], address)
+
+	instruction, err := hex.DecodeString(solanaCall.EncodedInstruction)
+	if err != nil {
+		return nil, fmt.Errorf("failed to decode instruction: %w", err)
+	}
+
+	body, err := vaa.BodyGeneralPurposeGovernanceSolana{
+		ChainID:            vaa.ChainID(solanaCall.ChainId),
+		GovernanceContract: governanceContract,
+		Instruction:        instruction,
+	}.Serialize()
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to serialize governance body: %w", err)
+	}
+
+	v := vaa.CreateGovernanceVAA(timestamp, nonce, sequence, guardianSetIndex, body)
 	return v, nil
 }
 
@@ -456,6 +729,8 @@ func GovMsgToVaa(message *nodev1.GovernanceMessage, currentSetIndex uint32, time
 		v, err = tokenBridgeRegisterChain(payload.BridgeRegisterChain, timestamp, currentSetIndex, message.Nonce, message.Sequence)
 	case *nodev1.GovernanceMessage_BridgeContractUpgrade:
 		v, err = tokenBridgeUpgradeContract(payload.BridgeContractUpgrade, timestamp, currentSetIndex, message.Nonce, message.Sequence)
+	case *nodev1.GovernanceMessage_RecoverChainId:
+		v, err = recoverChainId(payload.RecoverChainId, timestamp, currentSetIndex, message.Nonce, message.Sequence)
 	case *nodev1.GovernanceMessage_AccountantModifyBalance:
 		v, err = accountantModifyBalance(payload.AccountantModifyBalance, timestamp, currentSetIndex, message.Nonce, message.Sequence)
 	case *nodev1.GovernanceMessage_WormchainStoreCode:
@@ -464,18 +739,30 @@ func GovMsgToVaa(message *nodev1.GovernanceMessage, currentSetIndex uint32, time
 		v, err = wormchainInstantiateContract(payload.WormchainInstantiateContract, timestamp, currentSetIndex, message.Nonce, message.Sequence)
 	case *nodev1.GovernanceMessage_WormchainMigrateContract:
 		v, err = wormchainMigrateContract(payload.WormchainMigrateContract, timestamp, currentSetIndex, message.Nonce, message.Sequence)
+	case *nodev1.GovernanceMessage_WormchainWasmInstantiateAllowlist:
+		v, err = wormchainWasmInstantiateAllowlist(payload.WormchainWasmInstantiateAllowlist, timestamp, currentSetIndex, message.Nonce, message.Sequence)
+	case *nodev1.GovernanceMessage_GatewayScheduleUpgrade:
+		v, err = gatewayScheduleUpgrade(payload.GatewayScheduleUpgrade, timestamp, currentSetIndex, message.Nonce, message.Sequence)
+	case *nodev1.GovernanceMessage_GatewayCancelUpgrade:
+		v, err = gatewayCancelUpgrade(timestamp, currentSetIndex, message.Nonce, message.Sequence)
+	case *nodev1.GovernanceMessage_GatewayIbcComposabilityMwSetContract:
+		v, err = gatewayIbcComposabilityMwSetContract(payload.GatewayIbcComposabilityMwSetContract, timestamp, currentSetIndex, message.Nonce, message.Sequence)
 	case *nodev1.GovernanceMessage_CircleIntegrationUpdateWormholeFinality:
 		v, err = circleIntegrationUpdateWormholeFinality(payload.CircleIntegrationUpdateWormholeFinality, timestamp, currentSetIndex, message.Nonce, message.Sequence)
 	case *nodev1.GovernanceMessage_CircleIntegrationRegisterEmitterAndDomain:
 		v, err = circleIntegrationRegisterEmitterAndDomain(payload.CircleIntegrationRegisterEmitterAndDomain, timestamp, currentSetIndex, message.Nonce, message.Sequence)
 	case *nodev1.GovernanceMessage_CircleIntegrationUpgradeContractImplementation:
 		v, err = circleIntegrationUpgradeContractImplementation(payload.CircleIntegrationUpgradeContractImplementation, timestamp, currentSetIndex, message.Nonce, message.Sequence)
-	case *nodev1.GovernanceMessage_IbcReceiverUpdateChannelChain:
-		v, err = ibcReceiverUpdateChannelChain(payload.IbcReceiverUpdateChannelChain, timestamp, currentSetIndex, message.Nonce, message.Sequence)
+	case *nodev1.GovernanceMessage_IbcUpdateChannelChain:
+		v, err = ibcUpdateChannelChain(payload.IbcUpdateChannelChain, timestamp, currentSetIndex, message.Nonce, message.Sequence)
 	case *nodev1.GovernanceMessage_WormholeRelayerSetDefaultDeliveryProvider:
 		v, err = wormholeRelayerSetDefaultDeliveryProvider(payload.WormholeRelayerSetDefaultDeliveryProvider, timestamp, currentSetIndex, message.Nonce, message.Sequence)
+	case *nodev1.GovernanceMessage_EvmCall:
+		v, err = evmCallToVaa(payload.EvmCall, timestamp, currentSetIndex, message.Nonce, message.Sequence)
+	case *nodev1.GovernanceMessage_SolanaCall:
+		v, err = solanaCallToVaa(payload.SolanaCall, timestamp, currentSetIndex, message.Nonce, message.Sequence)
 	default:
-		panic(fmt.Sprintf("unsupported VAA type: %T", payload))
+		err = fmt.Errorf("unsupported VAA type: %T", payload)
 	}
 
 	return v, err
@@ -508,7 +795,19 @@ func (s *nodePrivilegedService) InjectGovernanceVAA(ctx context.Context, req *no
 			zap.String("digest", digest.String()),
 		)
 
-		s.injectC <- v
+		vaaInjectionsTotal.Inc()
+
+		s.injectC <- &common.MessagePublication{
+			TxHash:           ethcommon.Hash{},
+			Timestamp:        v.Timestamp,
+			Nonce:            v.Nonce,
+			Sequence:         v.Sequence,
+			ConsistencyLevel: v.ConsistencyLevel,
+			EmitterChain:     v.EmitterChain,
+			EmitterAddress:   v.EmitterAddress,
+			Payload:          v.Payload,
+			Unreliable:       false,
+		}
 
 		digests[i] = digest.Bytes()
 	}
@@ -597,7 +896,7 @@ func (s *nodePrivilegedService) fetchMissing(
 
 			// Inject into the gossip signed VAA receive path.
 			// This has the same effect as if the VAA was received from the network
-			// (verifying signature, publishing to BigTable, storing in local DB...).
+			// (verifying signature, storing in local DB...).
 			s.signedInC <- &gossipv1.SignedVAAWithQuorum{
 				Vaa: vaaBytes,
 			}
@@ -735,7 +1034,11 @@ func (s *nodePrivilegedService) ChainGovernorResetReleaseTimer(ctx context.Conte
 		return nil, fmt.Errorf("the VAA id must be specified as \"chainId/emitterAddress/seqNum\"")
 	}
 
-	resp, err := s.governor.ResetReleaseTimer(req.VaaId)
+	if req.NumDays < 1 || req.NumDays > maxResetReleaseTimerDays {
+		return nil, fmt.Errorf("the specified number of days falls outside the range of 1 to %d", maxResetReleaseTimerDays)
+	}
+
+	resp, err := s.governor.ResetReleaseTimer(req.VaaId, req.NumDays)
 	if err != nil {
 		return nil, err
 	}
@@ -812,8 +1115,8 @@ func (s *nodePrivilegedService) SignExistingVAA(ctx context.Context, req *nodev1
 
 	// Make sure there are no duplicates. Compact needs to take a sorted slice to remove all duplicates.
 	newGSSorted := slices.Clone(newGS)
-	slices.SortFunc(newGSSorted, func(a, b ethcommon.Address) bool {
-		return bytes.Compare(a[:], b[:]) < 0
+	slices.SortFunc(newGSSorted, func(a, b ethcommon.Address) int {
+		return bytes.Compare(a[:], b[:])
 	})
 	newGsLen := len(newGSSorted)
 	if len(slices.Compact(newGSSorted)) != newGsLen {
@@ -860,11 +1163,27 @@ func (s *nodePrivilegedService) SignExistingVAA(ctx context.Context, req *nodev1
 	}
 
 	// Add local signature
-	newVAA.AddSignature(s.gk, uint8(localGuardianIndex))
+	sig, err := s.guardianSigner.Sign(v.SigningDigest().Bytes())
+	if err != nil {
+		panic(err)
+	}
+
+	signature := [ecdsaSignatureLength]byte{}
+	copy(signature[:], sig)
+
+	newVAA.Signatures = append(v.Signatures, &vaa.Signature{
+		Index:     uint8(localGuardianIndex),
+		Signature: signature,
+	})
 
 	// Sort VAA signatures by guardian ID
-	slices.SortFunc(newVAA.Signatures, func(a, b *vaa.Signature) bool {
-		return a.Index < b.Index
+	slices.SortFunc(newVAA.Signatures, func(a, b *vaa.Signature) int {
+		if a.Index < b.Index {
+			return -1
+		} else if a.Index > b.Index {
+			return 1
+		}
+		return 0
 	})
 
 	newVAABytes, err := newVAA.Marshal()
@@ -878,5 +1197,122 @@ func (s *nodePrivilegedService) SignExistingVAA(ctx context.Context, req *nodev1
 func (s *nodePrivilegedService) DumpRPCs(ctx context.Context, req *nodev1.DumpRPCsRequest) (*nodev1.DumpRPCsResponse, error) {
 	return &nodev1.DumpRPCsResponse{
 		Response: s.rpcMap,
+	}, nil
+}
+
+func (s *nodePrivilegedService) GetAndObserveMissingVAAs(ctx context.Context, req *nodev1.GetAndObserveMissingVAAsRequest) (*nodev1.GetAndObserveMissingVAAsResponse, error) {
+	// Get URL and API key from the command line
+	url := req.GetUrl()
+	apiKey := req.GetApiKey()
+
+	// Create the body of the request
+	jsonBody := []byte(`{"apiKey": "` + apiKey + `"}`)
+	jsonBodyReader := bytes.NewReader(jsonBody)
+
+	// Create the actual request
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, url, jsonBodyReader)
+	if err != nil {
+		fmt.Printf("GetAndObserveMissingVAAs: could not create request: %s\n", err)
+		return nil, err
+	}
+
+	httpRequest.Header.Set("Content-Type", "application/json")
+
+	client := http.Client{
+		Timeout: 30 * time.Second,
+	}
+
+	// Call the cloud function to get the missing VAAs
+	results, err := client.Do(httpRequest)
+	if err != nil {
+		fmt.Printf("GetAndObserveMissingVAAs: error making http request: %s\n", err)
+		return nil, err
+	}
+
+	// Collect the results
+	resBody, err := io.ReadAll(results.Body)
+	if err != nil {
+		fmt.Printf("GetAndObserveMissingVAAs: could not read response body: %s\n", err)
+		return nil, err
+	}
+	fmt.Printf("client: response body: %s\n", resBody)
+	type MissingVAA struct {
+		Chain  int    `json:"chain"`
+		VaaKey string `json:"vaaKey"`
+		Txhash string `json:"txhash"`
+	}
+	var missingVAAs []MissingVAA
+	err = json.Unmarshal(resBody, &missingVAAs)
+	if err != nil {
+		fmt.Printf("GetAndObserveMissingVAAs: could not unmarshal response body: %s\n", err)
+		return nil, err
+	}
+
+	MAX_VAAS_TO_PROCESS := 25
+	// Only do a max of 25 at a time so as to not overload the node
+	numVaas := len(missingVAAs)
+	processingLen := numVaas
+	if processingLen > MAX_VAAS_TO_PROCESS {
+		processingLen = MAX_VAAS_TO_PROCESS
+	}
+
+	// Start injecting the VAAs
+	obsCounter := 0
+	errCounter := 0
+	errMsgs := "Messages: "
+	for i := 0; i < processingLen; i++ {
+		missingVAA := missingVAAs[i]
+		// First check to see if this VAA has already been signed
+		// Convert vaaKey to VAAID
+		splits := strings.Split(missingVAA.VaaKey, "/")
+		chainID, err := strconv.Atoi(splits[0])
+		if err != nil {
+			errMsgs += fmt.Sprintf("\nerror converting chainID [%s] to int", missingVAA.VaaKey)
+			errCounter++
+			continue
+		}
+		sequence, err := strconv.ParseUint(splits[2], 10, 64)
+		if err != nil {
+			errMsgs += fmt.Sprintf("\nerror converting sequence %s to uint64", splits[2])
+			errCounter++
+			continue
+		}
+		vaaKey := db.VAAID{EmitterChain: vaa.ChainID(chainID), EmitterAddress: vaa.Address([]byte(splits[1])), Sequence: sequence}
+		hasVaa, err := s.db.HasVAA(vaaKey)
+		if err != nil || hasVaa {
+			errMsgs += fmt.Sprintf("\nerror checking for VAA %s", missingVAA.VaaKey)
+			errCounter++
+			continue
+		}
+		var obsvReq gossipv1.ObservationRequest
+		obsvReq.ChainId = uint32(missingVAA.Chain)
+		obsvReq.TxHash, err = hex.DecodeString(strings.TrimPrefix(missingVAA.Txhash, "0x"))
+		if err != nil {
+			obsvReq.TxHash, err = base58.Decode(missingVAA.Txhash)
+			if err != nil {
+				errMsgs += "Invalid transaction hash (neither hex nor base58)"
+				errCounter++
+				continue
+			}
+		}
+		errMsgs += fmt.Sprintf("\nAttempting to observe %s", missingVAA.Txhash)
+		// Call the following function to send the observation request
+		if err := common.PostObservationRequest(s.obsvReqSendC, &obsvReq); err != nil {
+			errMsgs += fmt.Sprintf("\nPostObservationRequest error %s", err.Error())
+			errCounter++
+			continue
+		}
+		obsCounter++
+	}
+	response := "There were no missing VAAs to recover."
+	if processingLen > 0 {
+		response = fmt.Sprintf("Successfully injected %d of %d VAAs. %d errors were encountered.", obsCounter, processingLen, errCounter)
+		if numVaas > MAX_VAAS_TO_PROCESS {
+			response += fmt.Sprintf("\nOnly %d of the %d missing VAAs were processed.  Run the command again to process more.", MAX_VAAS_TO_PROCESS, numVaas)
+		}
+	}
+	response += "\n" + errMsgs
+	return &nodev1.GetAndObserveMissingVAAsResponse{
+		Response: response,
 	}, nil
 }

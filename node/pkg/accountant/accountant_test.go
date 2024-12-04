@@ -21,9 +21,11 @@ import (
 	"github.com/certusone/wormhole/node/pkg/common"
 	"github.com/certusone/wormhole/node/pkg/db"
 	"github.com/certusone/wormhole/node/pkg/devnet"
+	"github.com/certusone/wormhole/node/pkg/guardiansigner"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	"github.com/wormhole-foundation/wormhole/sdk/vaa"
 	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest"
 )
 
 const (
@@ -100,7 +102,9 @@ func newAccountantForTest(
 ) *Accountant {
 	var db db.MockAccountantDB
 
-	gk := devnet.InsecureDeterministicEcdsaKeyByIndex(ethCrypto.S256(), uint64(0))
+	pk := devnet.InsecureDeterministicEcdsaKeyByIndex(ethCrypto.S256(), uint64(0))
+	guardianSigner, err := guardiansigner.GenerateSignerWithPrivatekeyUnsafe(pk)
+	require.NoError(t, err)
 
 	gst := common.NewGuardianSetState(nil)
 	gs := &common.GuardianSet{Keys: []ethCommon.Address{ethCommon.HexToAddress("0xbeFA429d57cD18b7F8A4d91A2da9AB4AF05d0FBe")}}
@@ -120,13 +124,15 @@ func newAccountantForTest(
 		"none",       // accountantWS
 		wormchainConn,
 		accountantCheckEnabled,
-		gk,
+		"",
+		nil,
+		guardianSigner,
 		gst,
 		acctWriteC,
 		env,
 	)
 
-	err := acct.Start(ctx)
+	err = acct.Start(ctx)
 	require.NoError(t, err)
 	return acct
 }
@@ -323,7 +329,7 @@ func TestInterestingTransferShouldBeBlockedWhenEnforcingAccountant(t *testing.T)
 
 func TestForDeadlock(t *testing.T) {
 	ctx := context.Background()
-	logger, _ := zap.NewDevelopment()
+	logger := zaptest.NewLogger(t)
 	obsvReqWriteC := make(chan *gossipv1.ObservationRequest, 10)
 	acctChan := make(chan *common.MessagePublication, MsgChannelCapacity)
 	wormchainConn := MockAccountantWormchainConn{}

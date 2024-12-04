@@ -2,7 +2,6 @@ package node
 
 import (
 	"context"
-	"crypto/ecdsa"
 	"fmt"
 	"net"
 	"os"
@@ -12,13 +11,13 @@ import (
 	"github.com/certusone/wormhole/node/pkg/common"
 	"github.com/certusone/wormhole/node/pkg/db"
 	"github.com/certusone/wormhole/node/pkg/governor"
+	"github.com/certusone/wormhole/node/pkg/guardiansigner"
 	gossipv1 "github.com/certusone/wormhole/node/pkg/proto/gossip/v1"
 	nodev1 "github.com/certusone/wormhole/node/pkg/proto/node/v1"
 	publicrpcv1 "github.com/certusone/wormhole/node/pkg/proto/publicrpc/v1"
 	"github.com/certusone/wormhole/node/pkg/publicrpc"
 	"github.com/certusone/wormhole/node/pkg/supervisor"
 	"github.com/certusone/wormhole/node/pkg/watchers/evm/connectors"
-	"github.com/wormhole-foundation/wormhole/sdk/vaa"
 	"go.uber.org/zap"
 
 	ethcommon "github.com/ethereum/go-ethereum/common"
@@ -28,13 +27,13 @@ import (
 func adminServiceRunnable(
 	logger *zap.Logger,
 	socketPath string,
-	injectC chan<- *vaa.VAA,
+	injectC chan<- *common.MessagePublication,
 	signedInC chan<- *gossipv1.SignedVAAWithQuorum,
 	obsvReqSendC chan<- *gossipv1.ObservationRequest,
 	db *db.Database,
 	gst *common.GuardianSetState,
 	gov *governor.ChainGovernor,
-	gk *ecdsa.PrivateKey,
+	guardianSigner guardiansigner.GuardianSigner,
 	ethRpc *string,
 	ethContract *string,
 	rpcMap map[string]string,
@@ -76,7 +75,7 @@ func adminServiceRunnable(
 	var evmConnector connectors.Connector
 	if ethRpc != nil && ethContract != nil {
 		contract := ethcommon.HexToAddress(*ethContract)
-		evmConnector, err = connectors.NewEthereumConnector(ctx, "eth", *ethRpc, contract, logger)
+		evmConnector, err = connectors.NewEthereumBaseConnector(ctx, "eth", *ethRpc, contract, logger)
 		if err != nil {
 			return nil, fmt.Errorf("failed to connecto to ethereum")
 		}
@@ -90,8 +89,8 @@ func adminServiceRunnable(
 		signedInC,
 		gov,
 		evmConnector,
-		gk,
-		ethcrypto.PubkeyToAddress(gk.PublicKey),
+		guardianSigner,
+		ethcrypto.PubkeyToAddress(guardianSigner.PublicKey()),
 		rpcMap,
 	)
 

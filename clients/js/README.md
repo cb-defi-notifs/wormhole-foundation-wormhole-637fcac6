@@ -4,7 +4,7 @@ This tool is a command line interface to Wormhole.
 
 ## Installation
 
-Pull down the repo if you dont already have it and cd to the appropriate directory:
+Pull down the repo if you don't already have it and cd to the appropriate directory:
 
     git clone https://github.com/wormhole-foundation/wormhole
     cd wormhole/clients/js
@@ -28,16 +28,14 @@ Commands:
   worm edit-vaa                      Edits or generates a VAA
   worm evm                           EVM utilities
   worm generate                      generate VAAs (devnet and testnet only)
-  worm info                          Contract, chain, rpc and address informatio
-                                     n utilities
+  worm info                          Contract, chain, rpc and address information utilities
   worm near                          NEAR utilities
   worm parse <vaa>                   Parse a VAA (can be in either hex or base64
                                       format)
   worm recover <digest> <signature>  Recover an address from a signature
   worm submit <vaa>                  Execute a VAA
   worm sui                           Sui utilities
-  worm verify-vaa                    Verifies a VAA by querying the core contrac
-                                     t on Ethereum
+  worm verify-vaa                    Verifies a VAA by querying the core contract on Ethereum
 
 Options:
   --help     Show help                                                 [boolean]
@@ -81,6 +79,16 @@ Options:
 </details>
 
 <details>
+<summary> chains </summary>
+
+```sh
+Options:
+  --help     Show help                                                 [boolean]
+  --version  Show version number                                       [boolean]
+```
+</details>
+
+<details>
 <summary> edit-vaa </summary>
 
 ```sh
@@ -94,8 +102,8 @@ Options:
       --signatures, --sigs         comma separated list of signatures   [string]
       --wormscanurl, --wsu         url to wormscan entry for the vaa that
                                    includes signatures                  [string]
-      --wormscanfile, --wsf        json file containing wormscan entry for the
-                                   vaa that includes signatures         [string]
+      --wormscan, --ws             if specified, will query the wormscan entry
+                                   for the vaa to get the signatures   [boolean]
       --emitter-chain-id, --ec     emitter chain id to be used in the vaa
                                                                         [number]
       --emitter-address, --ea      emitter address to be used in the vaa[string]
@@ -250,12 +258,8 @@ Positionals:
 Options:
       --help              Show help                                    [boolean]
       --version           Show version number                          [boolean]
-  -c, --chain             chain name
-             [choices: "unset", "solana", "ethereum", "terra", "bsc", "polygon",
-        "avalanche", "oasis", "algorand", "aurora", "fantom", "karura", "acala",
-            "klaytn", "celo", "near", "moonbeam", "neon", "terra2", "injective",
-         "osmosis", "sui", "aptos", "arbitrum", "optimism", "gnosis", "pythnet",
-                           "xpla", "btc", "base", "sei", "wormchain", "sepolia"]
+  -c, --chain             chain name. To see a list of supported chains, run
+                          `worm chains`                                 [string]
   -n, --network           Network
                             [required] [choices: "mainnet", "testnet", "devnet"]
   -a, --contract-address  Contract to submit VAA to (override config)   [string]
@@ -299,6 +303,25 @@ Options:
 </details>
 
 <details>
+<summary> transfer </summary>
+
+```sh
+Options:
+      --help        Show help                                          [boolean]
+      --version     Show version number                                [boolean]
+      --src-chain   source chain. To see a list of supported chains, run `worm
+                    chains`                                  [string] [required]
+      --dst-chain   destination chain. To see a list of supported chains, run
+                    `worm chains`                            [string] [required]
+      --dst-addr    destination address                      [string] [required]
+      --token-addr  token address               [string] [default: native token]
+      --amount      token amount                             [string] [required]
+  -n, --network     Network [required] [choices: "mainnet", "testnet", "devnet"]
+      --rpc         RPC endpoint                                        [string]
+```
+</details>
+
+<details>
 <summary> verify-vaa </summary>
 
 ```sh
@@ -316,12 +339,8 @@ Options:
 ```sh
 Positionals:
   network  Network                     [choices: "mainnet", "testnet", "devnet"]
-  chain    Source chain
-             [choices: "unset", "solana", "ethereum", "terra", "bsc", "polygon",
-        "avalanche", "oasis", "algorand", "aurora", "fantom", "karura", "acala",
-            "klaytn", "celo", "near", "moonbeam", "neon", "terra2", "injective",
-         "osmosis", "sui", "aptos", "arbitrum", "optimism", "gnosis", "pythnet",
-                           "xpla", "btc", "base", "sei", "wormchain", "sepolia"]
+  chain    Source chain. To see a list of supported chains, run `worm chains`
+                                                                        [string]
   tx       Source transaction hash                                      [string]
 
 Options:

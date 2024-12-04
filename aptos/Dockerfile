@@ -1,14 +1,19 @@
 FROM cli-gen AS cli-export
 FROM const-gen AS const-export
-FROM ghcr.io/wormhole-foundation/aptos:1.0.4_2@sha256:020ff492894ad93fd5ad94f75c93e791b191983d0f40fe7dae793758fd0f96f9 as aptos
+FROM ghcr.io/wormhole-foundation/aptos:3.1.0@sha256:c359f25cd6b2cd9edb2634504756a3b179cd416fd73fda59f66c48168e3b69da as aptos
 
-# Support additional root CAs
-COPY cert.pem* /certs/
-RUN if [ -e /certs/cert.pem ]; then cp /certs/cert.pem /etc/ssl/certs/ca-certificates.crt; fi
-
-# Install nodejs 
+# Install nodejs
 # todo(aki): move this into base image?
-RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - && apt-get update && apt-get install -y nodejs
+RUN apt-get update
+RUN apt-get install -y ca-certificates curl gnupg
+RUN mkdir -p /etc/apt/keyrings
+RUN curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg
+
+ARG NODE_MAJOR=18
+RUN echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_$NODE_MAJOR.x nodistro main" | tee /etc/apt/sources.list.d/nodesource.list
+
+RUN apt-get update
+RUN apt-get install nodejs -y
 
 WORKDIR /tmp
 

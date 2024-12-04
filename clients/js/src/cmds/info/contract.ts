@@ -1,12 +1,7 @@
-import {
-  CHAINS,
-  ChainName,
-  assertChain,
-} from "@certusone/wormhole-sdk/lib/esm/utils/consts";
 import yargs from "yargs";
-import { CONTRACTS } from "../../consts";
-import { assertNetwork } from "../../utils";
 import { impossible } from "../../vaa";
+import { contracts } from "@wormhole-foundation/sdk-base";
+import { chainToChain, getNetwork } from "../../utils";
 
 export const command = "contract <network> <chain> <module>";
 export const desc = "Print contract address";
@@ -18,39 +13,40 @@ export const builder = (y: typeof yargs) =>
       demandOption: true,
     } as const)
     .positional("chain", {
-      describe: "Chain to query",
-      choices: Object.keys(CHAINS) as ChainName[],
+      describe:
+        "Chain to query. To see a list of supported chains, run `worm chains`",
+      type: "string",
       demandOption: true,
     } as const)
     .positional("module", {
       describe: "Module to query",
-      choices: ["Core", "NFTBridge", "TokenBridge"],
+      choices: ["Core", "NFTBridge", "TokenBridge", "WormholeRelayer"],
       demandOption: true,
     } as const);
 export const handler = async (
   argv: Awaited<ReturnType<typeof builder>["argv"]>
 ) => {
-  const network = argv.network.toUpperCase();
-  assertNetwork(network);
-  const chain = argv.chain;
-  assertChain(chain);
+  const network = getNetwork(argv.network);
+  const chain = chainToChain(argv.chain);
   const module = argv["module"];
 
   let addr: string | undefined;
   switch (module) {
     case "Core":
-      addr = CONTRACTS[network][chain].core;
+      addr = contracts.coreBridge.get(network, chain);
       break;
     case "NFTBridge":
-      const addresses = CONTRACTS[network][chain];
-      if (!("nft_bridge" in addresses)) {
+      addr = contracts.nftBridge.get(network, chain);
+      if (!addr) {
         throw new Error(`NFTBridge not deployed on ${chain}`);
       }
 
-      addr = addresses.nft_bridge;
       break;
     case "TokenBridge":
-      addr = CONTRACTS[network][chain].token_bridge;
+      addr = contracts.tokenBridge.get(network, chain);
+      break;
+    case "WormholeRelayer":
+      addr = contracts.relayer.get(network, chain);
       break;
     default:
       impossible(module);
